@@ -45,11 +45,11 @@ nonisolated enum ImageRenderer {
             : aspectRatio
         let crop = centerCrop(source, to: orientedAspectRatio)
         let rendered = cameraCIImage(
-            crop,
+            LivePhotoFrameRenderer.filterInput(crop),
             character: character,
             adjustment: adjustment,
             includesTexture: false
-        )
+        ).cropped(to: crop.extent)
         return rendered.transformed(by: CGAffineTransform(
             translationX: -rendered.extent.minX,
             y: -rendered.extent.minY

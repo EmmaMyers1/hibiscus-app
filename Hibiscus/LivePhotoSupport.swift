@@ -322,11 +322,17 @@ nonisolated enum LivePhotoProcessor {
         export.outputFileType = .mov
         export.shouldOptimizeForNetworkUse = false
         export.metadata = (try? await asset.load(.metadata)) ?? []
-        export.videoComposition = AVVideoComposition(asset: asset) { request in
+        let composition = AVVideoComposition(asset: asset) { request in
             let source = request.sourceImage
-            let output = ImageRenderer.gradeCIImage(source, settings: settings).cropped(to: source.extent)
+            let graded = ImageRenderer.gradeCIImage(
+                LivePhotoFrameRenderer.filterInput(source), settings: settings
+            ).cropped(to: source.extent)
+            let output = LivePhotoFrameRenderer.output(graded, renderSize: request.renderSize)
             request.finish(with: output, context: ImageRenderer.context)
         }
+        guard let mutable = composition.mutableCopy() as? AVMutableVideoComposition else { return false }
+        mutable.renderSize = LivePhotoFrameRenderer.encoderSize(composition.renderSize)
+        export.videoComposition = mutable
         await withCheckedContinuation { continuation in
             export.exportAsynchronously {
                 continuation.resume()
@@ -351,19 +357,20 @@ nonisolated enum LivePhotoProcessor {
         export.shouldOptimizeForNetworkUse = false
         export.metadata = (try? await asset.load(.metadata)) ?? []
         let composition = AVVideoComposition(asset: asset) { request in
+            let rendered = ImageRenderer.cameraMotionCIImage(
+                request.sourceImage,
+                character: character,
+                adjustment: adjustment,
+                aspectRatio: aspectRatio,
+                inputExposureEV: 0
+            )
             request.finish(
-                with: ImageRenderer.cameraMotionCIImage(
-                    request.sourceImage,
-                    character: character,
-                    adjustment: adjustment,
-                    aspectRatio: aspectRatio,
-                    inputExposureEV: 0
-                ),
+                with: LivePhotoFrameRenderer.output(rendered, renderSize: request.renderSize),
                 context: nil
             )
         }
-        if let mutable = composition as? AVMutableVideoComposition,
-           let track = try? await asset.loadTracks(withMediaType: .video).first,
+        guard let mutable = composition.mutableCopy() as? AVMutableVideoComposition else { return false }
+        if let track = try? await asset.loadTracks(withMediaType: .video).first,
            let naturalSize = try? await track.load(.naturalSize),
            let transform = try? await track.load(.preferredTransform) {
             mutable.renderSize = renderSize(
@@ -371,7 +378,8 @@ nonisolated enum LivePhotoProcessor {
                 portraitAspectRatio: aspectRatio
             )
         }
-        export.videoComposition = composition
+        mutable.renderSize = LivePhotoFrameRenderer.encoderSize(mutable.renderSize)
+        export.videoComposition = mutable
         await withCheckedContinuation { continuation in
             export.exportAsynchronously { continuation.resume() }
         }

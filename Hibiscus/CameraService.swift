@@ -66,7 +66,9 @@ final class CameraService: NSObject, ObservableObject {
         didSet { captureAspectRatio = selectedRatio.portraitRatio }
     }
     @Published var selectedTimer: CaptureTimerOption = .off
-    @Published var selectedMotion: CaptureMotionOption = .photo
+    @Published var selectedMotion: CaptureMotionOption = .photo {
+        didSet { requestsLivePhoto = selectedMotion == .livePhoto }
+    }
     @Published private(set) var isLivePhotoAvailable = false
     @Published private(set) var isConfiguringLivePhoto = false
     @Published private(set) var availableMegapixels: [Int] = [12]
@@ -100,6 +102,8 @@ final class CameraService: NSObject, ObservableObject {
     nonisolated(unsafe) private var renderCharacterAdjustment = CameraCharacterAdjustment.centered
     nonisolated(unsafe) private var captureAspectRatio: CGFloat = CameraAspectRatio.standard.portraitRatio
     nonisolated(unsafe) private var captureFormat: CaptureFormatOption = .processed
+    nonisolated(unsafe) private var requestsLivePhoto = false
+    nonisolated(unsafe) private var livePhotoResolutionLimited = false
     nonisolated private let resolutionLock = NSLock()
     nonisolated(unsafe) private var supportedPhotoDimensions: [CMVideoDimensions] = []
     nonisolated(unsafe) private var capturePhotoDimensions = CMVideoDimensions(width: 0, height: 0)
@@ -108,6 +112,8 @@ final class CameraService: NSObject, ObservableObject {
     nonisolated(unsafe) private var pendingProcessedImage: UIImage?
     nonisolated(unsafe) private var pendingPreviewImage: UIImage?
     nonisolated(unsafe) private var pendingRawData: Data?
+    nonisolated(unsafe) private var captureRequiresRAW = false
+    nonisolated(unsafe) private var captureDeliveryComplete = false
     nonisolated(unsafe) private var pendingLivePhotoData: Data?
     nonisolated(unsafe) private var pendingLivePhotoMovieURL: URL?
     nonisolated(unsafe) private var captureUsesLivePhoto = false
@@ -316,6 +322,19 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private func captureNow() {
+        if captureFormat == .raw, photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            statusMessage = L10n.string("RAW capture failed. Please retake the photo.")
+            return
+        }
+        captureRequiresRAW = captureFormat == .raw
+        captureDeliveryComplete = false
+        if selectedMotion == .livePhoto,
+           !photoOutput.isLivePhotoCaptureEnabled || photoOutput.isLivePhotoCaptureSuspended {
+            // Never silently flatten a requested Live Photo into a still.
+            isLivePhotoAvailable = false
+            statusMessage = L10n.string("Live Photo isn’t available with the current camera configuration.")
+            return
+        }
         let recordsLivePhoto = selectedMotion == .livePhoto
             && captureFormat == .processed
             && photoOutput.isLivePhotoCaptureEnabled
@@ -476,7 +495,8 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     func switchCamera() {
-        guard capturedImage == nil, !isSwitchingCamera else { return }
+        guard capturedImage == nil, !isSwitchingCamera, !isCapturing,
+              !isConfiguringLivePhoto else { return }
 #if DEBUG && targetEnvironment(simulator)
         if isSimulatorDemoCameraEnabled {
             position = position == .back ? .front : .back
@@ -528,6 +548,7 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     func selectLens(_ option: CameraLensOption) {
+        guard !isCapturing, !isConfiguringLivePhoto, !isSwitchingCamera else { return }
 #if DEBUG && targetEnvironment(simulator)
         if isSimulatorDemoCameraEnabled {
             lensLabel = option.label
@@ -593,7 +614,39 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     func selectCapture(format: CaptureFormatOption, megapixels: Int) {
+        guard !isCapturing, !isConfiguringLivePhoto else { return }
         guard format == .processed || isRAWAvailable else { return }
+        // Compatibility recovery can temporarily disable ProRAW. Restore it
+        // before accepting a RAW selection, not during capability discovery.
+        if livePhotoResolutionLimited || (format == .raw && photoOutput.isAppleProRAWSupported
+           && !photoOutput.isAppleProRAWEnabled) {
+            isConfiguringLivePhoto = true
+            selectedMotion = .photo
+            sessionQueue.async { [weak self] in
+                guard let self else { return }
+                let wasRunning = self.session.isRunning
+                if wasRunning { self.session.stopRunning() }
+                self.session.beginConfiguration()
+                self.photoOutput.isLivePhotoCaptureEnabled = false
+                if format == .raw { self.enableAppleProRAWIfSupported() }
+                self.session.commitConfiguration()
+                self.livePhotoResolutionLimited = false
+                if let device = self.cameraInput?.device {
+                    self.updatePhotoResolutionCapabilities(for: device)
+                }
+                self.refreshRAWAvailability()
+                if wasRunning { self.session.startRunning() }
+                Task { @MainActor in
+                    self.isLivePhotoAvailable = false
+                    self.isConfiguringLivePhoto = false
+                    if format == .processed || !self.photoOutput.isAppleProRAWSupported
+                        || self.photoOutput.isAppleProRAWEnabled {
+                        self.selectCapture(format: format, megapixels: megapixels)
+                    }
+                }
+            }
+            return
+        }
         resolutionLock.lock()
         let hasNativeTarget = supportedPhotoDimensions.contains {
             Self.megapixels(for: $0) == megapixels
@@ -628,9 +681,15 @@ final class CameraService: NSObject, ObservableObject {
 
     func selectMotion(_ option: CaptureMotionOption) {
         guard selectedFormat == .processed || option == .photo else { return }
-        guard !isConfiguringLivePhoto else { return }
+        guard !isConfiguringLivePhoto, !isCapturing, !isSwitchingCamera else { return }
         if option == .photo {
             selectedMotion = .photo
+            if livePhotoResolutionLimited {
+                resolutionLock.lock()
+                let preferred = requestedPhotoMegapixels ?? 24
+                resolutionLock.unlock()
+                selectCapture(format: .processed, megapixels: preferred)
+            }
             UISelectionFeedbackGenerator().selectionChanged()
             return
         }
@@ -683,7 +742,12 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private func saveCapture(automatic: Bool) {
-        guard !isSavingCapture else { return }
+        guard !isSavingCapture, !isProcessingCapture, captureDeliveryComplete else { return }
+        guard !captureRequiresRAW || pendingRawData != nil else {
+            didAutoSaveCapture = false
+            statusMessage = L10n.string("RAW capture failed. Please retake the photo.")
+            return
+        }
         isSavingCapture = true
         if let capturedLivePhoto {
             LivePhotoLibrarySaver.save([capturedLivePhoto], cleanUpAfterSave: false) { [weak self] success in
@@ -718,7 +782,7 @@ final class CameraService: NSObject, ObservableObject {
             includesLocation: location != nil,
             compressionQuality: 0.98
         )
-        guard let processedData else {
+        guard processedData != nil || rawData != nil else {
             isSavingCapture = false
             didAutoSaveCapture = false
             statusMessage = L10n.string("Couldn’t save this photo.")
@@ -734,15 +798,40 @@ final class CameraService: NSObject, ObservableObject {
                 }
                 return
             }
+            if let rawData {
+                RAWPhotoLibrarySaver.save(
+                    rawData: rawData, companionData: processedData,
+                    date: captureDate, location: location
+                ) { success, representation, diagnostic in
+                    Task { @MainActor in
+                        let failure = L10n.string("Couldn’t save this photo.")
+                            + (diagnostic.map { "\n\($0)" } ?? "")
+                        service.finishCaptureSave(
+                            success: success, automatic: automatic,
+                            successMessage: L10n.string("Saved to Photos"),
+                            failureMessage: failure
+                        )
+                        if success, representation == .rawOnly {
+                            service.statusMessage = L10n.string("Saved RAW. The processed companion couldn’t be saved.")
+                        } else if success, representation == .separate {
+                            service.statusMessage = L10n.string("Saved RAW and processed photo separately.")
+                        }
+                    }
+                }
+                return
+            }
+            guard let processedData else { return }
             PHPhotoLibrary.shared().performChanges {
                 let request = PHAssetCreationRequest.forAsset()
                 request.creationDate = captureDate
                 request.location = location
                 request.addResource(with: .photo, data: processedData, options: nil)
-                if let rawData {
-                    request.addResource(with: .alternatePhoto, data: rawData, options: nil)
+            } completionHandler: { success, error in
+#if DEBUG
+                if let error = error as NSError? {
+                    print("[Hibiscus Camera] Photos save failed: \(error.domain) (\(error.code)), RAW: \(rawData != nil)")
                 }
-            } completionHandler: { success, _ in
+#endif
                 Task { @MainActor in
                     service.finishCaptureSave(
                         success: success,
@@ -774,6 +863,7 @@ final class CameraService: NSObject, ObservableObject {
               captureProcessingToken == token,
               !didAttemptAutoSaveForCapture,
               !isProcessingCapture,
+              captureDeliveryComplete,
               capturedImage != nil,
               !captureUsesLivePhoto || capturedLivePhoto != nil else { return }
         didAttemptAutoSaveForCapture = true
@@ -871,6 +961,7 @@ final class CameraService: NSObject, ObservableObject {
             }
             Task { @MainActor [weak self] in
                 guard let self, self.captureProcessingToken == token else { return }
+                self.captureDeliveryComplete = true
                 self.pendingProcessedImage = processed
                 self.capturedImage = processed
                 self.capturedPreviewImage = processed
@@ -929,6 +1020,9 @@ final class CameraService: NSObject, ObservableObject {
         defer {
             session.commitConfiguration()
             if didConfigureSession {
+                if let device = cameraInput?.device {
+                    updatePhotoResolutionCapabilities(for: device)
+                }
                 refreshRAWAvailability()
                 reevaluateLivePhotoCompatibility()
 #if DEBUG
@@ -966,7 +1060,6 @@ final class CameraService: NSObject, ObservableObject {
                 session.addOutput(photoOutput)
                 photoOutput.maxPhotoQualityPrioritization = .quality
                 enableAppleProRAWIfSupported()
-                updatePhotoResolutionCapabilities(for: device)
             }
             if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                 _ = addAudioInputDuringConfiguration()
@@ -1023,7 +1116,6 @@ final class CameraService: NSObject, ObservableObject {
                 if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                     _ = addAudioInputDuringConfiguration()
                 }
-                updatePhotoResolutionCapabilities(for: device)
                 configureVideoConnectionFallback(for: device)
                 updateDeviceState(
                     device,
@@ -1040,6 +1132,7 @@ final class CameraService: NSObject, ObservableObject {
             finishCameraSwitchFailure(token: switchToken)
             return
         }
+        updatePhotoResolutionCapabilities(for: device)
         refreshRAWAvailability()
         reevaluateLivePhotoCompatibility(allowingCapture: hasCompatiblePreset)
 #if DEBUG
@@ -1053,8 +1146,9 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     nonisolated private func refreshRAWAvailability() {
-        enableAppleProRAWIfSupported()
-        let rawAvailable = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+        // Discovery must not silently undo a Live Photo-compatible pipeline.
+        let rawAvailable = photoOutput.isAppleProRAWSupported
+            || !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
         let rawMegapixels = rawAvailable ? supportedRAWPhotoMegapixels() : []
         Task { @MainActor in
 #if DEBUG && targetEnvironment(simulator)
@@ -1068,8 +1162,12 @@ final class CameraService: NSObject, ObservableObject {
 
     @discardableResult
     nonisolated private func reevaluateLivePhotoCompatibility(
-        allowingCapture: Bool = true
+        allowingCapture: Bool = true, requestingLivePhoto: Bool = false
     ) -> Bool {
+        if allowingCapture, requestingLivePhoto || requestsLivePhoto,
+           audioInput != nil, !photoOutput.isLivePhotoCaptureSupported {
+            recoverLivePhotoCompatibility()
+        }
         let available = allowingCapture
             && audioInput != nil
             && photoOutput.isLivePhotoCaptureSupported
@@ -1085,6 +1183,64 @@ final class CameraService: NSObject, ObservableObject {
             if !available { self.selectedMotion = .photo }
         }
         return available
+    }
+
+    /// Negotiate output constraints rather than repeatedly testing the same
+    /// incompatible configuration. Never take ownership of activeFormat.
+    /// Called on sessionQueue while the session is stopped.
+    nonisolated private func recoverLivePhotoCompatibility() {
+        guard !session.isRunning else { return }
+        let wasAutomatic = videoOutput.automaticallyConfiguresOutputBufferDimensions
+        let wasPreviewSized = videoOutput.deliversPreviewSizedOutputBuffers
+        let wasProRAWEnabled = photoOutput.isAppleProRAWEnabled
+        session.beginConfiguration()
+        videoOutput.automaticallyConfiguresOutputBufferDimensions = true
+        if session.canSetSessionPreset(.photo) { session.sessionPreset = .photo }
+        session.commitConfiguration()
+        if let device = cameraInput?.device {
+            updatePhotoResolutionCapabilities(for: device)
+        }
+#if DEBUG
+        debugLogCameraConfiguration(context: "Live Photo recovery: automatic preview dimensions")
+#endif
+        guard !photoOutput.isLivePhotoCaptureSupported else { return }
+
+        if photoOutput.isAppleProRAWEnabled {
+            session.beginConfiguration()
+            photoOutput.isAppleProRAWEnabled = false
+            session.commitConfiguration()
+#if DEBUG
+            debugLogCameraConfiguration(context: "Live Photo recovery: ProRAW disabled")
+#endif
+        }
+        guard !photoOutput.isLivePhotoCaptureSupported,
+              let device = cameraInput?.device else { return }
+        let dimensions = device.activeFormat.supportedMaxPhotoDimensions.sorted {
+            Int64($0.width) * Int64($0.height) > Int64($1.width) * Int64($1.height)
+        }
+        for candidate in dimensions where
+            Int64(candidate.width) * Int64(candidate.height)
+                < Int64(photoOutput.maxPhotoDimensions.width) * Int64(photoOutput.maxPhotoDimensions.height) {
+            session.beginConfiguration()
+            photoOutput.maxPhotoDimensions = candidate
+            session.commitConfiguration()
+#if DEBUG
+            debugLogCameraConfiguration(context: "Live Photo recovery: lower output ceiling")
+#endif
+            if photoOutput.isLivePhotoCaptureSupported {
+                livePhotoResolutionLimited = true
+                updatePhotoResolutionCapabilities(for: device, maximum: candidate)
+                return
+            }
+        }
+        // Unsupported even at the smallest size: don't leave still capture
+        // needlessly restricted after a failed recovery attempt.
+        session.beginConfiguration()
+        videoOutput.automaticallyConfiguresOutputBufferDimensions = wasAutomatic
+        if !wasAutomatic { videoOutput.deliversPreviewSizedOutputBuffers = wasPreviewSized }
+        if wasProRAWEnabled { enableAppleProRAWIfSupported() }
+        session.commitConfiguration()
+        updatePhotoResolutionCapabilities(for: device)
     }
 
     nonisolated private func addAudioInputDuringConfiguration() -> Bool {
@@ -1109,14 +1265,15 @@ final class CameraService: NSObject, ObservableObject {
         if hasCompatiblePreset {
             session.sessionPreset = .photo
         }
+        session.commitConfiguration()
         if let device = cameraInput?.device {
             updatePhotoResolutionCapabilities(for: device)
         }
-        session.commitConfiguration()
 
         refreshRAWAvailability()
         let available = reevaluateLivePhotoCompatibility(
-            allowingCapture: hasAudio && hasCompatiblePreset
+            allowingCapture: hasAudio && hasCompatiblePreset,
+            requestingLivePhoto: true
         )
 #if DEBUG
         debugLogCameraConfiguration(context: "Live Photo configuration")
@@ -1147,8 +1304,14 @@ final class CameraService: NSObject, ObservableObject {
     /// Discovers still resolutions from the format selected by AVFoundation's
     /// `.photo` preset. Resolution changes only update photo-output/settings
     /// dimensions; they never take ownership of `device.activeFormat`.
-    nonisolated private func updatePhotoResolutionCapabilities(for device: AVCaptureDevice) {
-        let supported = device.activeFormat.supportedMaxPhotoDimensions.sorted(by: {
+    nonisolated private func updatePhotoResolutionCapabilities(
+        for device: AVCaptureDevice, maximum limit: CMVideoDimensions? = nil
+    ) {
+        if limit == nil { livePhotoResolutionLimited = false }
+        let supported = device.activeFormat.supportedMaxPhotoDimensions.filter {
+            guard let limit else { return true }
+            return Int64($0.width) * Int64($0.height) <= Int64(limit.width) * Int64(limit.height)
+        }.sorted(by: {
             Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
         })
         guard let maximum = supported.last else { return }
@@ -1615,6 +1778,9 @@ final class CameraService: NSObject, ObservableObject {
               selectedPhotoResolution: \(selectedDimensions.width)x\(selectedDimensions.height) (~\(selectedMegapixels) MP)
               isLivePhotoCaptureSupported: \(photoOutput.isLivePhotoCaptureSupported)
               isLivePhotoCaptureEnabled: \(photoOutput.isLivePhotoCaptureEnabled)
+              isAppleProRAWEnabled: \(photoOutput.isAppleProRAWEnabled)
+              maxPhotoDimensions: \(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height)
+              automaticPreviewDimensions: \(videoOutput.automaticallyConfiguresOutputBufferDimensions)
               hasAudioInput: \(audioInput != nil)
             """
         )
@@ -1696,10 +1862,17 @@ extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate {
 
 extension CameraService: AVCapturePhotoCaptureDelegate {
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        if let error {
+#if DEBUG
+            let failure = error as NSError
+            print("[Hibiscus Camera] Photo processing failed: \(failure.domain) (\(failure.code)), RAW: \(photo.isRawPhoto)")
+#endif
+            return
+        }
         let data = captureLocation.map {
             photo.fileDataRepresentation(with: CapturePhotoMetadataCustomizer(location: $0))
         } ?? photo.fileDataRepresentation()
-        guard error == nil, let data else {
+        guard let data else {
             return
         }
         if photo.isRawPhoto {
@@ -1783,7 +1956,6 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
         didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
         error: Error?
     ) {
-        let processed = pendingProcessedImage
         let preview = pendingPreviewImage
         let usesLivePhoto = captureUsesLivePhoto
         let livePhotoData = pendingLivePhotoData
@@ -1794,11 +1966,15 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
         let liveTargetMegapixels = captureLiveTargetMegapixels
         let liveLocation = captureLocation
         let token = captureProcessingToken
+        let missingRAW = captureRequiresRAW && pendingRawData == nil
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, self.captureProcessingToken == token else { return }
+            self.captureDeliveryComplete = true
             self.isRecordingLivePhoto = false
             self.isCapturing = false
-            guard error == nil, let processed else {
+            // Rendering may finish while this callback waits for MainActor.
+            // Read the latest result here, not a stale low-resolution snapshot.
+            guard error == nil, let processed = self.pendingProcessedImage else {
                 self.isProcessingCapture = false
                 self.previewRenderer.resume()
                 self.statusMessage = L10n.string("Couldn’t capture this photo.")
@@ -1806,6 +1982,10 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
             }
             self.capturedImage = processed
             self.capturedPreviewImage = preview ?? processed
+            if missingRAW {
+                self.didAttemptAutoSaveForCapture = true
+                self.statusMessage = L10n.string("RAW capture failed. Please retake the photo.")
+            }
             if !usesLivePhoto {
                 self.autoSaveCaptureIfReady(token: token)
             }

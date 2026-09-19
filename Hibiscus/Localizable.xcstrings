@@ -1,6 +1,39 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Saved RAW and processed photo separately." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAW 和处理后的照片已分别保存。"
+          }
+        }
+      }
+    },
+    "Saved RAW. The processed companion couldn’t be saved." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAW 已保存，但处理后的配套照片未能保存。"
+          }
+        }
+      }
+    },
+    "RAW capture failed. Please retake the photo." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAW 拍摄失败，请重新拍摄。"
+          }
+        }
+      }
+    },
     "Long Press to Show Original" : {
       "extractionState" : "manual",
       "localizations" : {
